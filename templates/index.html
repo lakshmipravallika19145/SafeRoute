@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html>
+<head>
+
+<title>SafeRoute</title>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+
+<style>
+
+body{
+font-family: Arial;
+text-align:center;
+}
+
+#topbar{
+display:flex;
+flex-wrap:wrap;
+gap:10px;
+justify-content:center;
+align-items:center;
+margin:12px auto 0;
+width:90%;
+}
+
+#topbar input{
+padding:8px;
+min-width:260px;
+}
+
+#topbar button{
+padding:8px 12px;
+cursor:pointer;
+}
+
+#map{
+height:500px;
+width:90%;
+margin:auto;
+margin-top:20px;
+}
+
+.legend{
+margin-top:10px;
+}
+
+#status{
+width:90%;
+margin:10px auto 0;
+text-align:left;
+font-size:14px;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<h1>SafeRoute – AI Safety Navigation</h1>
+
+<p>Select start and destination on the map (Vijayawada). Then generate routes and we’ll score them by safety.</p>
+
+<div id="topbar">
+  <button id="btn-reset">Reset</button>
+  <button id="btn-routes">Generate 3 Routes</button>
+  <button id="btn-toggle-heat">Toggle Heatmap</button>
+
+  <input id="report-desc" placeholder="Report unsafe area (description)"/>
+  <select id="report-rating">
+    <option value="">Rating</option>
+    <option value="1">1 (Very unsafe)</option>
+    <option value="2">2</option>
+    <option value="3">3</option>
+    <option value="4">4</option>
+    <option value="5">5 (Safe)</option>
+  </select>
+  <button id="btn-report">Report at last click</button>
+</div>
+
+<div id="map"></div>
+
+<div class="legend">
+🟢 Safe Area &nbsp;&nbsp;
+🟡 Moderate Safety &nbsp;&nbsp;
+🔴 Unsafe Area
+</div>
+
+<div id="status"></div>
+
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.heat/dist/leaflet-heat.js"></script>
+
+<script>
+
+// Vijayawada center
+var map = L.map('map').setView([16.5062, 80.6480], 13);
+
+// OpenStreetMap layer
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution:'OpenStreetMap'
+}).addTo(map);
+
+// Start & Destination markers
+var startMarker = null;
+var endMarker = null;
+var lastClickLatLng = null;
+
+var routeLayers = [];
+var safetyPointsLayer = L.layerGroup().addTo(map);
+var heatLayer = null;
+var heatEnabled = true;
+
+function setStatus(html){
+  document.getElementById("status").innerHTML = html;
+}
+
+function zoneColor(zone){
+  if(zone === "safe") return "green";
+  if(zone === "moderate") return "orange";
+  return "red";
+}
+
+function clearRoutes(){
+  routeLayers.forEach(l => map.removeLayer(l));
+  routeLayers = [];
+}
+
+function resetAll(){
+  if(startMarker){ map.removeLayer(startMarker); startMarker = null; }
+  if(endMarker){ map.removeLayer(endMarker); endMarker = null; }
+  clearRoutes();
+  setStatus("");
+}
+
+map.on('click', function(e){
+lastClickLatLng = e.latlng;
+
+if(startMarker == null){
+
+startMarker = L.marker(e.latlng).addTo(map)
+.bindPopup("Start Location")
+.openPopup();
+
+}
+
+else if(endMarker == null){
+
+endMarker = L.marker(e.latlng).addTo(map)
+.bindPopup("Destination")
+.openPopup();
+
+}
+
+});
+
+// ---------- Load synthetic safety dataset ----------
+async function loadSafetyPoints(){
+  const res = await fetch("/api/safety_points");
+  const data = await res.json();
+
+  safetyPointsLayer.clearLayers();
+
+  const heatPts = [];
+  data.points.forEach(p => {
+    const color = zoneColor(p.zone);
+    const m = L.circleMarker([p.lat, p.lng], {
+      radius: 5,
+      color: color,
+      weight: 1,
+      fillColor: color,
+      fillOpacity: 0.65
+    }).bindPopup(
+      "<b>" + (p.area || "Location") + "</b><br/>" +
+      "Zone: " + p.zone + "<br/>" +
+      "Safety score: " + p.safety_score
+    );
+    m.addTo(safetyPointsLayer);
+
+    // Heat intensity: higher = more unsafe, so invert score (0..10) to (1..0)
+    const intensity = Math.max(0.05, (10 - p.safety_score) / 10);
+    heatPts.push([p.lat, p.lng, intensity]);
+  });
+
+  if(heatLayer){
+    map.removeLayer(heatLayer);
+    heatLayer = null;
+  }
+  heatLayer = L.heatLayer(heatPts, { radius: 25, blur: 18, maxZoom: 17 });
+  if(heatEnabled){
+    heatLayer.addTo(map);
+  }
+  setStatus("Loaded safety dataset: <b>" + data.count + "</b> points. Click map to set start/end, then generate routes.");
+}
+
+// ---------- Route generation & scoring ----------
+async function fetchRoutes(start, end){
+  // OSRM expects lng,lat
+  const url =
+    "https://router.project-osrm.org/route/v1/driving/" +
+    start.lng + "," + start.lat + ";" + end.lng + "," + end.lat +
+    "?overview=full&geometries=geojson&alternatives=true";
+  const res = await fetch(url);
+  return await res.json();
+}
+
+async function scoreRoute(coords){
+  const res = await fetch("/api/score_route", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ coordinates: coords, max_distance_m: 120 })
+  });
+  return await res.json();
+}
+
+async function generateAndScore(){
+  if(!startMarker || !endMarker){
+    setStatus("Please select <b>start</b> and <b>destination</b> by clicking on the map.");
+    return;
+  }
+
+  setStatus("Generating routes and computing safety scores…");
+  clearRoutes();
+
+  const routesJson = await fetchRoutes(startMarker.getLatLng(), endMarker.getLatLng());
+  if(!routesJson || routesJson.code !== "Ok"){
+    setStatus("Routing failed. Try again.");
+    return;
+  }
+
+  const routes = routesJson.routes.slice(0, 3);
+  const scored = [];
+
+  for(let i=0; i<routes.length; i++){
+    const r = routes[i];
+    const coords = r.geometry.coordinates; // [[lng,lat],...]
+    const score = await scoreRoute(coords);
+    scored.push({ idx: i, route: r, score: score });
+  }
+
+  scored.sort((a,b) => b.score.route_score - a.score.route_score);
+  const best = scored[0];
+
+  const summaries = scored.map((s, i) => {
+    return (
+      "<div>" +
+      "<b>Route " + String.fromCharCode(65 + s.idx) + "</b>: " +
+      "Score <b>" + s.score.route_score + "</b> (" + s.score.zone + "), " +
+      "nearby points: " + s.score.nearby_points_count +
+      (s === best ? " <b>← Safest</b>" : "") +
+      "</div>"
+    );
+  }).join("");
+
+  setStatus(summaries);
+
+  // Render routes (best highlighted thicker)
+  scored.forEach(s => {
+    const isBest = (s === best);
+    const color = isBest ? "#1a7f37" : (s.score.zone === "unsafe" ? "#b42318" : s.score.zone === "moderate" ? "#b54708" : "#2f6f3e");
+    const weight = isBest ? 7 : 4;
+    const opacity = isBest ? 0.9 : 0.55;
+    const line = L.geoJSON(s.route.geometry, {
+      style: { color: color, weight: weight, opacity: opacity }
+    }).addTo(map);
+    routeLayers.push(line);
+  });
+}
+
+// ---------- User reporting ----------
+async function submitReport(){
+  if(!lastClickLatLng){
+    setStatus("Click on the map first (that location will be reported).");
+    return;
+  }
+  const desc = document.getElementById("report-desc").value || "";
+  const rating = document.getElementById("report-rating").value || "";
+  const res = await fetch("/api/report", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      lat: lastClickLatLng.lat,
+      lng: lastClickLatLng.lng,
+      description: desc,
+      rating: rating ? parseInt(rating) : null
+    })
+  });
+  const data = await res.json();
+  if(data && data.ok){
+    setStatus("Report submitted. Thanks! (stored locally for this prototype)");
+  }else{
+    setStatus("Report failed: " + (data.error || "unknown error"));
+  }
+}
+
+// ---------- UI bindings ----------
+document.getElementById("btn-reset").addEventListener("click", resetAll);
+document.getElementById("btn-routes").addEventListener("click", generateAndScore);
+document.getElementById("btn-report").addEventListener("click", submitReport);
+document.getElementById("btn-toggle-heat").addEventListener("click", function(){
+  heatEnabled = !heatEnabled;
+  if(!heatLayer) return;
+  if(heatEnabled) heatLayer.addTo(map);
+  else map.removeLayer(heatLayer);
+});
+
+loadSafetyPoints();
+
+</script>
+
+</body>
+</html>

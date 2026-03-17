@@ -1,0 +1,26 @@
+# Virtual environment
+jarvis_env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment variables
+.env
+
+# Flask instance folder
+instance/
+
+# Audio files (optional if they are test files)
+*.wav
+
+# Logs
+*.log
+
+# VS Code
+.vscode/
+
+# OS junk
+.DS_Store
+Thumbs.db

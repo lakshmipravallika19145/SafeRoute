@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SafePath – AI Safety Navigation</title>
+
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+
+<body>
+  <div class="app-shell">
+    <!-- Left Sidebar -->
+    <aside class="panel sidebar" aria-label="Route planning sidebar">
+      <div class="brand">
+        <div class="brand__logo" aria-hidden="true">
+          <div class="brand__ring"></div>
+          <div class="brand__dot"></div>
+        </div>
+        <div class="brand__text">
+          <div class="brand__title">SafePath</div>
+          <div class="brand__subtitle">AI Safety Navigation</div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section__title">Route Planning</div>
+
+        <label class="field" id="start-wrap">
+          <span class="field__label">Current Location</span>
+          <input id="input-current" class="field__input" placeholder="e.g., Benz Circle" autocomplete="off" />
+          <div id="suggest-current" class="suggest" aria-label="Start location suggestions"></div>
+        </label>
+
+        <label class="field" id="dest-wrap">
+          <span class="field__label">Destination</span>
+          <input id="input-dest" class="field__input" placeholder="e.g., Vijayawada Railway Station" autocomplete="off" />
+          <div id="suggest-dest" class="suggest" aria-label="Destination suggestions"></div>
+        </label>
+
+        <div class="row">
+          <button id="btn-find" class="btn btn--primary">Find Safe Routes</button>
+          <button id="btn-reset" class="btn btn--ghost" title="Clear markers and routes">Reset</button>
+        </div>
+
+        <div class="hint">
+          Tip: you can also click on the map to set Start then Destination.
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section__title">Optimization</div>
+        <div class="chips" role="radiogroup" aria-label="Optimization options">
+          <label class="chip">
+            <input type="radio" name="opt" value="safest" checked />
+            <span>Safest Route</span>
+          </label>
+          <label class="chip">
+            <input type="radio" name="opt" value="balanced" />
+            <span>Balanced Route</span>
+          </label>
+          <label class="chip">
+            <input type="radio" name="opt" value="fastest" />
+            <span>Fastest Route</span>
+          </label>
+          <label class="chip">
+            <input type="radio" name="opt" value="welllit" />
+            <span>Well‑Lit Route</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section__title">Safety Filters</div>
+        <div class="toggles">
+          <label class="toggle">
+            <span class="toggle__text">Street Lighting</span>
+            <input id="t-light" type="checkbox" checked />
+            <span class="toggle__ui" aria-hidden="true"></span>
+          </label>
+          <label class="toggle">
+            <span class="toggle__text">Crowd Density</span>
+            <input id="t-crowd" type="checkbox" checked />
+            <span class="toggle__ui" aria-hidden="true"></span>
+          </label>
+          <label class="toggle">
+            <span class="toggle__text">Police Patrol</span>
+            <input id="t-police" type="checkbox" checked />
+            <span class="toggle__ui" aria-hidden="true"></span>
+          </label>
+          <label class="toggle">
+            <span class="toggle__text">Crime Reports</span>
+            <input id="t-crime" type="checkbox" checked />
+            <span class="toggle__ui" aria-hidden="true"></span>
+          </label>
+          <label class="toggle">
+            <span class="toggle__text">CCTV Coverage</span>
+            <input id="t-cctv" type="checkbox" checked />
+            <span class="toggle__ui" aria-hidden="true"></span>
+          </label>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section__title">Routes</div>
+        <div id="route-cards" class="cards">
+          <!-- Filled by JS -->
+          <div class="card card--skeleton">
+            <div class="card__title">Safest Route</div>
+            <div class="card__meta">
+              <span class="pill">ETA —</span>
+              <span class="pill">— km</span>
+              <span class="pill pill--accent">—%</span>
+            </div>
+            <div class="bar">
+              <div class="bar__fill" style="width: 0%"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Center Map -->
+    <main class="map-wrap" aria-label="Map panel">
+      <div class="map-top">
+        <div class="map-top__left">
+          <div class="badge">Vijayawada Prototype</div>
+          <div id="status" class="status">Loading safety dataset…</div>
+        </div>
+        <div class="map-top__right">
+          <button id="btn-heat" class="btn btn--ghost">Toggle Heatmap</button>
+          <button id="btn-report" class="btn btn--ghost">Report at last click</button>
+        </div>
+      </div>
+
+      <div class="map-frame">
+        <div id="map" class="map"></div>
+        <div class="map-grid" aria-hidden="true"></div>
+      </div>
+    </main>
+
+    <!-- Right Panel -->
+    <aside class="panel right" aria-label="Safety information panel">
+      <div class="section">
+        <div class="section__title">Safety Legend</div>
+        <div class="legend">
+          <div class="legend__item">
+            <span class="dot dot--safe"></span> Safe
+          </div>
+          <div class="legend__item">
+            <span class="dot dot--moderate"></span> Moderate
+          </div>
+          <div class="legend__item">
+            <span class="dot dot--unsafe"></span> Unsafe
+          </div>
+        </div>
+        <div class="legend__sub">
+          Green routes are recommended; red routes indicate higher risk.
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section__title">Incident Insights</div>
+        <div id="incident-list" class="incidents">
+          <div class="incident incident--muted">Generate routes to see nearby high‑risk points.</div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section__title">Quick Report</div>
+        <label class="field">
+          <span class="field__label">Place name</span>
+          <input id="report-place" class="field__input" placeholder="e.g., MG Road lane" />
+        </label>
+        <label class="field">
+          <span class="field__label">Description</span>
+          <input id="report-desc" class="field__input" placeholder="e.g., Poor lighting" />
+        </label>
+        <label class="field">
+          <span class="field__label">Safety rating</span>
+          <select id="report-rating" class="field__input">
+            <option value="">Choose</option>
+            <option value="1">1 (Very unsafe)</option>
+            <option value="2">2</option>
+            <option value="3">3</option>
+            <option value="4">4</option>
+            <option value="5">5 (Safe)</option>
+          </select>
+        </label>
+        <button id="btn-report-submit" class="btn btn--primary">Submit</button>
+      </div>
+    </aside>
+  </div>
+
+  <!-- Bottom navigation / Navigation Dashboard -->
+  <div class="bottom-nav" role="region" aria-label="Navigation dashboard">
+    <div class="bottom-nav__left">
+      <div class="mini">
+        <div class="mini__label">Current Location</div>
+        <div id="bn-current" class="mini__value">—</div>
+      </div>
+      <div class="mini">
+        <div class="mini__label">Destination</div>
+        <div id="bn-dest" class="mini__value">—</div>
+      </div>
+      <div class="mini mini--wide">
+        <div class="mini__label">AI Recommendation</div>
+        <div id="bn-reco" class="mini__value">—</div>
+      </div>
+      <div class="mini">
+        <div class="mini__label">Remaining Distance</div>
+        <div id="bn-remaining" class="mini__value">—</div>
+      </div>
+      <div class="mini">
+        <div class="mini__label">ETA</div>
+        <div id="bn-eta" class="mini__value">—</div>
+      </div>
+      <div class="mini">
+        <div class="mini__label">Current Speed</div>
+        <div id="bn-speed" class="mini__value">—</div>
+      </div>
+      <div class="mini">
+        <div class="mini__label">Next Waypoint</div>
+        <div id="bn-next" class="mini__value">—</div>
+      </div>
+      <div class="mini">
+        <div class="mini__label">Safety Level</div>
+        <div id="bn-score" class="mini__value">—</div>
+      </div>
+    </div>
+    <div class="bottom-nav__right">
+      <button id="btn-start-nav" class="btn btn--primary btn--glow">Start Navigation</button>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
+
