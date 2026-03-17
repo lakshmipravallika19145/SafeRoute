@@ -214,6 +214,4 @@ Scores are normalized to a **0–100 safety percentage**.
 # Author
 
 Lakshmi Pravallika
-SRM University – Summer Internship Project
-
 Project Theme: **AI Safety Navigation for Women**
