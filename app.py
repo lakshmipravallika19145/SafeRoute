@@ -1,17 +1,30 @@
 import json
 import math
+import os
+import requests
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, session
 from flask_cors import CORS
+from flask_sqlalchemy import SQLAlchemy
+from dotenv import load_dotenv
+
+load_dotenv()  # allow setting Twilio creds in .env
+
+try:
+    from twilio.rest import Client
+except ImportError:
+    Client = None
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 SAFETY_POINTS_PATH = DATA_DIR / "safety_points.json"
 USER_REPORTS_PATH = DATA_DIR / "user_reports.jsonl"
+
+FAST2SMS_API_KEY = "EUa8staznIqxRxDYi7k1ZhK8FiRaLUbdShtv7SZJhGvNQwFoLy6e4qnvZpHa"
 
 _ROUTES_CACHE: dict = {}
 _CACHE_TTL_S = 60
@@ -33,6 +46,25 @@ SAFETY_PERCENT_THRESHOLDS = {
     "safe": 70.0,
     "moderate": 40.0,
 }
+
+# Flask-SQLAlchemy emergency contacts support
+# (prefers MySQL saferoute, falls back to SQLite if connector isn't installed)
+
+try:
+    import pymysql  # noqa: F401
+    SQLALCHEMY_DATABASE_URI = "mysql+pymysql://root:Qazqaz12%23@localhost/saferoute"
+except ImportError:
+    SQLALCHEMY_DATABASE_URI = f"sqlite:///{BASE_DIR / 'saferoute.db'}"
+
+db = SQLAlchemy()
+
+class EmergencyContact(db.Model):
+    __tablename__ = "emergency_contacts"
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    user_id = db.Column(db.Integer, nullable=False, default=1)
+    contact_name = db.Column(db.String(100), nullable=True)
+    phone = db.Column(db.String(15), nullable=False)
+    created_at = db.Column(db.DateTime, server_default=db.func.now())
 
 
 def _read_json(path: Path, default):
@@ -136,6 +168,129 @@ def _zone_label(score_or_pct: float) -> str:
     return _zone_label_from_percent(pct)
 
 
+def _classify_road_type(step_name: str) -> str:
+    if not step_name or not isinstance(step_name, str):
+        return "local"
+    n = step_name.lower()
+    if "ghat" in n:
+        return "ghat"
+    if "highway" in n or "express" in n or "nh" in n or "sh" in n or "motorway" in n:
+        return "highway"
+    return "local"
+
+
+_SPEED_M_S_BY_MODE = {
+    "car": {"highway": 27.78, "ghat": 13.89, "local": 11.11},
+    "truck": {"highway": 19.44, "ghat": 9.72, "local": 8.33},
+    "bike": {"highway": 6.94, "ghat": 4.17, "local": 5.56},
+    "walk": {"highway": 1.39, "ghat": 0.97, "local": 1.39},
+}
+
+
+def _compute_route_distances_by_road_type(route):
+    distances = {"highway": 0.0, "ghat": 0.0, "local": 0.0}
+    legs = route.get("legs") or []
+    for leg in legs:
+        for step in leg.get("steps", []):
+            dist = float(step.get("distance", 0.0))
+            rtype = _classify_road_type(step.get("name", ""))
+            if rtype not in distances:
+                rtype = "local"
+            distances[rtype] += dist
+    # Fallback all to local if no step-based classification exists
+    total = sum(distances.values())
+    if total <= 1e-3:
+        distances["local"] = float(route.get("distance", 0.0) or 0.0)
+    return distances
+
+
+def _road_speed_limit_kmh(road_type: str) -> float:
+    limits = {"highway": 100.0, "ghat": 40.0, "local": 50.0}
+    return float(limits.get(road_type, 50.0))
+
+
+def _mode_speed_factor(mode: str) -> float:
+    factors = {"car": 0.9, "truck": 0.7, "bike": 0.4, "walk": 0.2}
+    return float(factors.get(mode, 0.5))
+
+
+def _kmh_to_ms(kmh: float) -> float:
+    return max(0.1, float(kmh) / 3.6)
+
+
+def _historical_traffic_multiplier(departure_ts: float | None = None) -> float:
+    if departure_ts is None:
+        now = datetime.now(timezone.utc)
+    else:
+        now = datetime.fromtimestamp(departure_ts, tz=timezone.utc)
+
+    hour = now.hour
+    weekday = now.weekday()  # 0=Monday..6=Sunday
+
+    # Peak weekday morning and evening:
+    if weekday < 5 and (7 <= hour < 10):
+        return 1.25
+    if weekday < 5 and (17 <= hour < 20):
+        return 1.3
+    # Light weekend traffic
+    if weekday >= 5 and (10 <= hour < 18):
+        return 1.1
+    return 1.0
+
+
+def _realtime_traffic_multiplier(realtime_traffic_factor: float | None, report_level: float | None) -> float:
+    if realtime_traffic_factor is None:
+        realtime_traffic_factor = 1.0
+    if report_level is None:
+        report_level = 1.0
+    return max(0.5, min(3.0, float(realtime_traffic_factor) * float(report_level)))
+
+
+def _compute_mode_durations(distances):
+    result = {}
+    for mode in _SPEED_M_S_BY_MODE.keys():
+        total_seconds = 0.0
+        for road_type, dist in distances.items():
+            limit = _road_speed_limit_kmh(road_type)
+            base_speed_ms = _kmh_to_ms(limit * _mode_speed_factor(mode))
+            if base_speed_ms > 0:
+                total_seconds += dist / base_speed_ms
+        result[mode] = float(total_seconds)
+    return result
+
+
+def _estimate_route_durations(route, historical_factor=1.0, realtime_factor=1.0):
+    # Use route distance as the canonical base for mode duration comparisons
+    total_dist_m = float(route.get("distance") or 0.0)
+
+    # realistic average speeds (km/h)
+    base_speeds_kmh = {
+        "car": 60.0,
+        "truck": 45.0,
+        "bike": 15.0,
+        "walk": 5.0,
+    }
+
+    # Convert to m/s
+    base_speeds_ms = {m: _kmh_to_ms(v) for m, v in base_speeds_kmh.items()}
+
+    car = total_dist_m / base_speeds_ms["car"] if base_speeds_ms["car"] > 0 else 0.0
+    truck = total_dist_m / base_speeds_ms["truck"] if base_speeds_ms["truck"] > 0 else 0.0
+    bike = total_dist_m / base_speeds_ms["bike"] if base_speeds_ms["bike"] > 0 else 0.0
+    walk = total_dist_m / base_speeds_ms["walk"] if base_speeds_ms["walk"] > 0 else 0.0
+
+    # apply traffic multipliers only for motor vehicles
+    car *= historical_factor * realtime_factor
+    truck *= historical_factor * realtime_factor
+
+    return {
+        "car": float(car),
+        "truck": float(truck),
+        "bike": float(bike),
+        "walk": float(walk),
+    }
+
+
 def _http_get_json(url: str, headers: dict | None = None, timeout_s: int = 12):
     """
     Small HTTP JSON helper with timeouts.
@@ -148,15 +303,20 @@ def _http_get_json(url: str, headers: dict | None = None, timeout_s: int = 12):
 
 
 def _osrm_routes(start_lat: float, start_lng: float, end_lat: float, end_lng: float, timeout_s: int = 12):
+    return _osrm_routes_by_profile(start_lat, start_lng, end_lat, end_lng, "driving", timeout_s=timeout_s)
+
+
+def _osrm_routes_by_profile(start_lat: float, start_lng: float, end_lat: float, end_lng: float, profile: str, timeout_s: int = 12):
     # OSRM expects lng,lat
-    base = "https://router.project-osrm.org/route/v1/driving/"
+    base = f"https://router.project-osrm.org/route/v1/{profile}/"
     coords = f"{start_lng},{start_lat};{end_lng},{end_lat}"
+
+    # Note: not all public OSRM profiles may support steps/alternatives; using flags safely.
     qs = urllib.parse.urlencode(
         {
             "overview": "full",
             "geometries": "geojson",
-            "alternatives": "true",
-            # Needed for navigation-style UI (turn-by-turn)
+            "alternatives": "true" if profile == "driving" else "false",
             "steps": "true",
         }
     )
@@ -371,6 +531,13 @@ def _route_safety_score(nearby: list, fallback_points: list | None = None) -> fl
 
 def create_app():
     app = Flask(__name__, template_folder="templates", static_folder="static")
+    app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL", SQLALCHEMY_DATABASE_URI)
+    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+    db.init_app(app)
+
+    with app.app_context():
+        db.create_all()
+
     CORS(app)
 
     @app.route("/")
@@ -396,6 +563,230 @@ def create_app():
             p2["zone"] = _zone_label_from_percent(pct)
             enriched.append(p2)
         return jsonify({"count": len(enriched), "points": enriched})
+
+    @app.route("/api/save_profile", methods=["POST"])
+    def save_profile():
+        payload = request.get_json(silent=True)
+        if not payload or not isinstance(payload, dict):
+            return jsonify({"error": "Invalid JSON payload"}), 400
+
+        user_data_dir = DATA_DIR / "user_data"
+        user_data_dir.mkdir(parents=True, exist_ok=True)
+
+        users_file = user_data_dir / "users.json"
+        users = []
+        if users_file.exists():
+            try:
+                with users_file.open("r", encoding="utf-8") as f:
+                    users = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                users = []
+
+        if not isinstance(users, list):
+            users = []
+
+        users.append(payload)
+
+        with users_file.open("w", encoding="utf-8") as f:
+            json.dump(users, f, indent=4)
+
+        # Persist emergency contacts into SQL table (user_id defaults to 1 for this demo)
+        contacts = payload.get("contacts") if isinstance(payload, dict) else None
+        if contacts and isinstance(contacts, list):
+            try:
+                EmergencyContact.query.filter_by(user_id=1).delete()
+                db.session.commit()
+                for i, phone in enumerate(contacts[:3]):
+                    if not phone:
+                        continue
+                    entry = EmergencyContact(user_id=1, contact_name=f"Contact {i + 1}", phone=str(phone).strip())
+                    db.session.add(entry)
+                db.session.commit()
+            except Exception as e:
+                app.logger.error("Failed to save contacts to DB: %s", e)
+
+        return jsonify({"status": "saved"})
+
+    @app.route("/api/get_contacts", methods=["GET"])
+    def get_contacts():
+        user_id = request.args.get("user_id", type=int) or 1
+        try:
+            results = EmergencyContact.query.filter_by(user_id=user_id).limit(3).all()
+            if results:
+                phones = [c.phone for c in results if c.phone]
+                return jsonify({"contacts": phones})
+        except Exception as e:
+            app.logger.error("Error fetching contacts from DB: %s", e)
+
+        # fallback to local user file
+        contacts = []
+        try:
+            user_data_dir = DATA_DIR / "user_data"
+            users_file = user_data_dir / "users.json"
+            if users_file.exists():
+                with users_file.open("r", encoding="utf-8") as f:
+                    users = json.load(f)
+                if isinstance(users, list) and users:
+                    profile = users[-1]
+                    if isinstance(profile, dict):
+                        contacts = profile.get("contacts", [])
+        except Exception:
+            contacts = []
+
+        return jsonify({"contacts": contacts})
+
+    @app.route("/api/sos_alert", methods=["POST"])
+    def sos_alert():
+        data = request.get_json(silent=True)
+        if not data or not isinstance(data, dict):
+            return jsonify({"error": "Invalid JSON payload"}), 400
+
+        name = data.get("name")
+        lat = data.get("lat")
+        lng = data.get("lng")
+        contacts = data.get("contacts", [])
+
+        if not name or lat is None or lng is None or not contacts:
+            return jsonify({"error": "Invalid SOS data"}), 400
+
+        # sanitize/validate contacts as 10-digit numbers (Fast2SMS requirement)
+        clean_numbers = []
+        for n in contacts:
+            s = str(n).strip()
+            if s.startswith("+91"):
+                s = s[3:]
+            if s.startswith("91") and len(s) == 12:
+                s = s[2:]
+            if len(s) == 10 and s.isdigit():
+                clean_numbers.append(s)
+
+        if not clean_numbers:
+            return jsonify({"error": "No valid 10-digit contact numbers"}), 400
+
+        numbers = ",".join(clean_numbers)
+
+        message = f"EMERGENCY ALERT!\n\n{name} may be in danger.\n\nLocation: https://maps.google.com/?q={lat},{lng}"
+
+        url = "https://www.fast2sms.com/dev/bulkV2"
+
+        payload = {
+            "route": "q",
+            "sender_id": "TXTIND",
+            "message": message,
+            "language": "english",
+            "flash": 0,
+            "numbers": numbers,
+        }
+
+        headers = {
+            "authorization": FAST2SMS_API_KEY,
+            "Content-Type": "application/json",
+        }
+
+        response_json = None
+        try:
+            # Primary: send JSON payload (newer Fast2SMS API expectations)
+            response = requests.post(url, json=payload, headers=headers, timeout=30)
+            print("Fast2SMS response text (JSON):", response.text)
+            response_json = response.json()
+        except Exception as e:
+            print("Fast2SMS request failed (JSON):", e)
+            response_json = {"error": str(e)}
+
+        # Fallback for the 990 'old API' message (some accounts still require form encoding)
+        if isinstance(response_json, dict) and response_json.get("status_code") == 990:
+            try:
+                fallback_headers = {
+                    "authorization": FAST2SMS_API_KEY,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                }
+                response = requests.post(url, data=payload, headers=fallback_headers, timeout=30)
+                print("Fast2SMS response text (form fallback):", response.text)
+                response_json = response.json()
+            except Exception as e:
+                print("Fast2SMS request failed (form fallback):", e)
+                response_json = {"error": str(e)}
+
+        # still persist SOS log for audit/history
+        user_data_dir = DATA_DIR / "user_data"
+        user_data_dir.mkdir(parents=True, exist_ok=True)
+        sos_file = user_data_dir / "sos_logs.json"
+
+        sos_logs = []
+        if sos_file.exists():
+            try:
+                with sos_file.open("r", encoding="utf-8") as f:
+                    sos_logs = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                sos_logs = []
+
+        if not isinstance(sos_logs, list):
+            sos_logs = []
+
+        sos_logs.append(data)
+
+        with sos_file.open("w", encoding="utf-8") as f:
+            json.dump(sos_logs, f, indent=4)
+
+        return jsonify({"status": "SMS sent", "response": response_json})
+
+    @app.route("/api/send_whatsapp", methods=["POST"])
+    def send_whatsapp():
+        data = request.get_json(silent=True)
+        if not data or not isinstance(data, dict):
+            return jsonify({"error": "Invalid JSON payload"}), 400
+
+        contacts = data.get("contacts") or []
+        lat = data.get("lat")
+        lng = data.get("lng")
+        name = data.get("name", "SOS User")
+
+        if not contacts or lat is None or lng is None:
+            return jsonify({"error": "Missing contacts or location"}), 400
+
+        if Client is None:
+            return jsonify({"error": "Twilio package is not installed"}), 500
+
+        sid = os.getenv("TWILIO_ACCOUNT_SID")
+        token = os.getenv("TWILIO_AUTH_TOKEN")
+        from_whatsapp = os.getenv("TWILIO_WHATSAPP_FROM")
+
+        if not sid or not token or not from_whatsapp:
+            return jsonify({"error": "Twilio credentials not configured"}), 500
+
+        client = Client(sid, token)
+        link = f"https://www.google.com/maps?q={lat},{lng}"
+        message_text = f"🚨 SOS ALERT\n{name} may be in danger.\nLive location: {link}"
+
+        results = []
+        for phone in contacts[:3]:
+            if not phone:
+                continue
+            normalized = str(phone).strip().lstrip("+")
+            if normalized.startswith("91") and len(normalized) >= 12:
+                normalized = normalized[2:]
+            if len(normalized) != 10 or not normalized.isdigit():
+                results.append({"phone": phone, "status": "invalid"})
+                continue
+
+            to = f"whatsapp:+91{normalized}"
+            try:
+                msg = client.messages.create(from_=from_whatsapp, body=message_text, to=to)
+                results.append({"phone": phone, "status": "sent", "sid": msg.sid})
+            except Exception as ex:
+                results.append({"phone": phone, "status": "error", "error": str(ex)})
+
+        return jsonify({"status": "done", "results": results})
+
+    @app.route("/api/wallet_status", methods=["GET"])
+    def wallet_status():
+        """Check Fast2SMS wallet status using query param authorization (docs requirement)."""
+        wallet_url = f"https://www.fast2sms.com/dev/wallet?authorization={FAST2SMS_API_KEY}"
+        try:
+            r = requests.get(wallet_url, timeout=20)
+            return jsonify({"status_code": r.status_code, "wallet": r.json()}), r.status_code
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
     @app.route("/api/geocode", methods=["GET"])
     def geocode():
@@ -436,6 +827,7 @@ def create_app():
         """
         Nominatim autocomplete proxy.
         Frontend uses this to avoid CORS/UA issues and keep API calls consistent.
+        Supports global search + optional proximity prioritization.
         """
         q = (request.args.get("q") or "").strip()
         if len(q) < 2:
@@ -443,9 +835,12 @@ def create_app():
 
         limit = 10
 
-        # Vijayawada-ish bounding box (bias results; do NOT hard-restrict only to the box)
-        # viewbox = left,top,right,bottom
-        viewbox = "80.55,16.58,80.72,16.44"
+        try:
+            near_lat = float(request.args.get("near_lat")) if request.args.get("near_lat") else None
+            near_lng = float(request.args.get("near_lng")) if request.args.get("near_lng") else None
+        except ValueError:
+            near_lat = None
+            near_lng = None
 
         headers = {
             # Nominatim policy: identify the application
@@ -453,7 +848,7 @@ def create_app():
             "Accept-Language": "en",
         }
 
-        def run_search(query: str, bounded: bool):
+        def run_search(query: str, bounded: bool, viewbox: str | None = None):
             params = {
                 "format": "json",
                 "q": query,
@@ -461,23 +856,16 @@ def create_app():
                 "addressdetails": "1",
                 "namedetails": "1",
                 "extratags": "1",
-                "viewbox": viewbox,
                 "bounded": "1" if bounded else "0",
-                # Prefer POI-like results (shops/malls/universities) when available
                 "featuretype": "city",
             }
+            if viewbox:
+                params["viewbox"] = viewbox
+
             url = "https://nominatim.openstreetmap.org/search?" + urllib.parse.urlencode(params)
             return _http_get_json(url, headers=headers, timeout_s=12)
 
-        # 1) Strictly bounded search (best for nearby / Vijayawada)
-        data_local = run_search(q, bounded=True)
-
-        # 2) Broader search but still biased by viewbox (helps recognize partial/global names)
-        # Add "Vijayawada" bias phrase if the user didn't type it.
-        q2 = q if "vijayawada" in q.lower() else (q + " Vijayawada")
-        data_biased = run_search(q2, bounded=False)
-
-        # Merge + de-dupe results (by place_id if present, else display_name)
+        # 1) If client gave location, do local bounded search first
         merged = []
         seen = set()
 
@@ -489,8 +877,42 @@ def create_app():
                 seen.add(key)
                 merged.append(item)
 
-        add_items(data_local)
-        add_items(data_biased)
+        if near_lat is not None and near_lng is not None:
+            delta = 0.5  # degrees (~50km) around current location
+            viewbox = f"{near_lng - delta},{near_lat + delta},{near_lng + delta},{near_lat - delta}"
+            try:
+                local_data = run_search(q, bounded=True, viewbox=viewbox)
+                add_items(local_data)
+            except Exception:
+                local_data = []
+
+        # 2) Global search (always fallback for broad coverage)
+        try:
+            global_data = run_search(q, bounded=False, viewbox=None)
+            add_items(global_data)
+        except Exception:
+            global_data = []
+
+        # If partial query and short, also try fallback with country fixed or full text by default
+        if len(merged) < limit and " " not in q:
+            # to avoid queries like "New" being too local; include global best effort
+            try:
+                fallback = run_search(q, bounded=False, viewbox=None)
+                add_items(fallback)
+            except Exception:
+                pass
+
+        # Sort by distance if near location is known
+        if near_lat is not None and near_lng is not None:
+            def item_distance(item):
+                try:
+                    lat = float(item.get("lat", 0.0))
+                    lng = float(item.get("lon", 0.0))
+                    return math.hypot((lat - near_lat) * 111320, (lng - near_lng) * 111320 * math.cos(math.radians(near_lat)))
+                except Exception:
+                    return float("inf")
+
+            merged.sort(key=item_distance)
 
         results = []
         ql = q.lower()
@@ -624,11 +1046,40 @@ def create_app():
         points = _read_json(SAFETY_POINTS_PATH, default=[])
         max_distance_m = float(payload.get("max_distance_m", 280.0))
 
+        departure = payload.get("departure_datetime")
+        departure_ts = None
+        if departure:
+            try:
+                departure_ts = datetime.fromisoformat(departure).replace(tzinfo=timezone.utc).timestamp()
+            except Exception:
+                departure_ts = None
+
+        hist_factor = _historical_traffic_multiplier(departure_ts)
+        realtime_factor = _realtime_traffic_multiplier(
+            payload.get("realtime_traffic_factor"),
+            payload.get("realtime_report_level"),
+        )
+
         # Use only OSRM routes (real road-following paths); no straight-line fallbacks
         osrm_routes = list((osrm.get("routes") or [])[:3])
 
+        # Individual mode assessments (bicycle, foot) from OSRM profile routes if available
+        bike_osrm = None
+        walk_osrm = None
+        try:
+            bike_osrm = _osrm_routes_by_profile(start_lat, start_lng, end_lat, end_lng, "bicycle", timeout_s=12)
+        except Exception:
+            bike_osrm = None
+        try:
+            walk_osrm = _osrm_routes_by_profile(start_lat, start_lng, end_lat, end_lng, "foot", timeout_s=12)
+        except Exception:
+            walk_osrm = None
+
+        bike_routes = list((bike_osrm.get("routes") if bike_osrm else [])[:3])
+        walk_routes = list((walk_osrm.get("routes") if walk_osrm else [])[:3])
+
         routes_out = []
-        for r in osrm_routes:
+        for idx, r in enumerate(osrm_routes):
             coords = (r.get("geometry") or {}).get("coordinates") or []
             nearby = _route_nearby_points(coords, points, max_distance_m=max_distance_m, weights=weights)
             fallback_pts = []
@@ -648,6 +1099,22 @@ def create_app():
             }
             route_ai_msg = route_ai_messages.get(zone, route_ai_messages["moderate"])
 
+            road_type_distances = _compute_route_distances_by_road_type(r)
+
+            def route_duration_or_fallback(route_list, default_speed_m_s):
+                if idx < len(route_list):
+                    return float((route_list[idx].get("duration") or 0.0)) * (hist_factor * realtime_factor)
+                dist_m = float(r.get("distance") or 0.0)
+                return dist_m / default_speed_m_s if default_speed_m_s > 0 else 0.0
+
+            car_duration = float(r.get("duration") or 0.0) * hist_factor * realtime_factor
+            truck_duration = car_duration * 1.25
+
+            # For bike and walk, use mode-specific comfortable speed (not driving speed)
+            dist_m = float(r.get("distance") or 0.0)
+            bike_duration = dist_m / _kmh_to_ms(15) if _kmh_to_ms(15) > 0 else 0.0
+            walk_duration = dist_m / _kmh_to_ms(5) if _kmh_to_ms(5) > 0 else 0.0
+
             routes_out.append(
                 {
                     "distance_m": float(r.get("distance") or 0.0),
@@ -655,6 +1122,20 @@ def create_app():
                     "geometry": r.get("geometry"),
                     # leg/step info for live navigation UI
                     "legs": r.get("legs") or [],
+                    # road type split
+                    "road_type_distance_m": {
+                        "highway": round(road_type_distances["highway"], 1),
+                        "ghat": round(road_type_distances["ghat"], 1),
+                        "local": round(road_type_distances["local"], 1),
+                    },
+                    "duration_by_mode_s": {
+                        "car": round(car_duration, 1),
+                        "truck": round(truck_duration, 1),
+                        "bike": round(bike_duration, 1),
+                        "walk": round(walk_duration, 1),
+                    },
+                    "historical_traffic_multiplier": round(hist_factor, 2),
+                    "realtime_traffic_multiplier": round(realtime_factor, 2),
                     # 0..100
                     "route_score": round(route_score, 1),
                     "zone": zone,

@@ -230,6 +230,15 @@ body{
 .btn--ghost{
   background: rgba(8, 12, 22, 0.30);
 }
+.btn--danger{
+  background: #ff4d6d;
+  color: white;
+  font-weight: bold;
+  border: none;
+}
+.btn--danger:hover{
+  background: #ff2a4f;
+}
 .btn--glow{
   box-shadow: 0 0 0 0 rgba(108,246,255,0.0);
 }
@@ -639,4 +648,44 @@ body{
   .sidebar{ order: 2; }
   .right{ display:none; }
 }
+.profile-modal{
+position:fixed;
+top:0;
+left:0;
+width:100vw;
+height:100vh;
+background:rgba(0,0,0,0.65);
+display:flex;
+align-items:center;
+justify-content:center;
+z-index:9999999;
+}
+.profile-box{
+background:white;
+padding:30px;
+border-radius:12px;
+width:350px;
+max-width:90%;
+display:flex;
+flex-direction:column;
+gap:12px;
+}
 
+.profile-box input{
+padding:10px;
+border:1px solid #ccc;
+border-radius:5px;
+}
+
+.profile-box button{
+background:#e63946;
+color:white;
+padding:10px;
+border:none;
+border-radius:5px;
+cursor:pointer;
+}
+
+#map{
+z-index:1;
+}

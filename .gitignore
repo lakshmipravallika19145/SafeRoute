@@ -24,3 +24,7 @@ instance/
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Data directories not for repo commits
+data/user_data/
+saferoute.db

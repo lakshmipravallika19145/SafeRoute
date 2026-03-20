@@ -164,6 +164,7 @@
     container: "map",
     style: {
       version: 8,
+      glyphs: "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf", 
       sources: {
         osm: {
           type: "raster",
@@ -202,7 +203,15 @@
   let routeSourceIds = [];
   let routeLayerIds = [];
   let arrowsLayerId = "route-arrows";
+function checkUserProfile(){
 
+let user = localStorage.getItem("safe_user")
+
+if(!user){
+document.getElementById("profileModal").style.display = "flex"
+}
+
+}
   function clearRoutes() {
     routeLayerIds.forEach((id) => {
       if (map.getLayer(id)) map.removeLayer(id);
@@ -261,6 +270,7 @@
   }
 
   map.on("load", () => {
+    checkUserProfile();
     map.on("click", (e) => {
       state.lastClick = { lat: e.lngLat.lat, lng: e.lngLat.lng };
       if (!state.start) {
@@ -545,7 +555,10 @@
    * Uses AbortController to cancel stale requests (performance).
    */
   async function fetchSuggestions(q, abortController) {
-    const url = "/api/autocomplete?q=" + encodeURIComponent(q);
+    let url = "/api/autocomplete?q=" + encodeURIComponent(q);
+    if (state.start && typeof state.start.lat === "number" && typeof state.start.lng === "number") {
+      url += "&near_lat=" + encodeURIComponent(state.start.lat) + "&near_lng=" + encodeURIComponent(state.start.lng);
+    }
     const res = await fetch(url, { signal: abortController.signal });
     const data = await res.json();
     return data;
@@ -812,6 +825,12 @@
           '<span class="pill">' + fmtKm(r.distance_m) + "</span>" +
           '<span class="pill pill--accent">' + pct + "%</span>" +
         "</div>" +
+        '<div class="card__meta">' +
+          '<span class="pill">Car ' + fmtMin(r.duration_by_mode_s?.car || r.duration_s) + '</span>' +
+          '<span class="pill">Bike ' + fmtMin(r.duration_by_mode_s?.bike || r.duration_s) + '</span>' +
+          '<span class="pill">Truck ' + fmtMin(r.duration_by_mode_s?.truck || r.duration_s) + '</span>' +
+          '<span class="pill">Walk ' + fmtMin(r.duration_by_mode_s?.walk || r.duration_s) + '</span>' +
+        '</div>' +
         '<div class="bar"><div class="bar__fill" style="width:' + pct + "%; background:" + color + '"></div></div>';
 
       card.addEventListener("click", () => {
@@ -1199,4 +1218,291 @@
     }
   }
 })();
+document.addEventListener("DOMContentLoaded", function(){
 
+  const saveBtn = document.getElementById("saveProfile");
+
+  if (saveBtn) {
+    saveBtn.addEventListener("click", function(){
+
+      let name = document.getElementById("userName").value.trim()
+      let phone = document.getElementById("userPhone").value.trim()
+
+      let c1 = document.getElementById("contact1").value.trim()
+      let c2 = document.getElementById("contact2").value.trim()
+      let c3 = document.getElementById("contact3").value.trim()
+
+      if(!name || !phone){
+        alert("Please enter your name and phone number");
+        return;
+      }
+
+      let profile = {
+        name:name,
+        phone:phone,
+        contacts:[c1,c2,c3]
+      }
+
+      // Keep quick local access for SOS/etc
+      localStorage.setItem("safe_user", JSON.stringify(profile))
+
+      // Persist profile on backend disk as well
+      fetch("/api/save_profile", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(profile)
+      })
+        .then((res) => res.json())
+        .then((data) => {
+          console.log("Profile saved on server", data)
+        })
+        .catch((err) => {
+          console.error("Failed to save profile on server", err)
+        })
+
+      document.getElementById("profileModal").style.display = "none"
+
+      console.log("Profile saved", profile)
+
+    });
+  }
+
+  const sosBtn = document.getElementById("sosBtn");
+  if (sosBtn) {
+    let sosIntervalId = null;
+    let sirenAudio = null;
+
+    const flashOverlay = document.createElement("div");
+    flashOverlay.style.position = "fixed";
+    flashOverlay.style.top = 0;
+    flashOverlay.style.left = 0;
+    flashOverlay.style.width = "100%";
+    flashOverlay.style.height = "100%";
+    flashOverlay.style.background = "rgba(255, 0, 0, 0.15)";
+    flashOverlay.style.pointerEvents = "none";
+    flashOverlay.style.zIndex = "9999";
+    flashOverlay.style.display = "none";
+    document.body.appendChild(flashOverlay);
+
+    function startAlarm() {
+      try {
+        if (!sirenAudio) {
+          sirenAudio = new Audio("/static/siren.mp3");
+          sirenAudio.loop = true;
+        }
+        sirenAudio.play().catch(() => console.warn("Siren auto-play blocked by browser"));
+      } catch (e) {
+        console.warn("Siren audio not available", e);
+      }
+      flashOverlay.style.display = "block";
+      setTimeout(() => {
+        flashOverlay.style.display = "none";
+      }, 2000);
+    }
+
+    function stopAlarm() {
+      if (sirenAudio) {
+        sirenAudio.pause();
+        sirenAudio.currentTime = 0;
+      }
+      flashOverlay.style.display = "none";
+    }
+
+    function stopTracking() {
+      if (sosIntervalId) {
+        clearInterval(sosIntervalId);
+        sosIntervalId = null;
+      }
+      stopAlarm();
+    }
+
+    function getContactsFromServer() {
+      return fetch("/api/get_contacts")
+        .then((res) => res.json())
+        .then((data) => Array.isArray(data.contacts) ? data.contacts.slice(0, 3) : [])
+        .catch((err) => {
+          console.warn("Failed to fetch /api/get_contacts", err);
+          return [];
+        });
+    }
+
+    function createLocationLink(lat, lng) {
+      return `https://www.google.com/maps?q=${lat},${lng}`;
+    }
+
+    function sendWhatsAppMessages(lat, lng, contacts, name) {
+      const link = createLocationLink(lat, lng);
+      const message = `🚨 SOS ALERT\n${name} may be in danger.\n\nLive location:\n${link}`;
+
+      // direct server-side send (no user interaction/popups)
+      return fetch("/api/send_whatsapp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lat, lng, name, contacts, message }),
+      })
+        .then((res) => res.json())
+        .then((data) => {
+          console.log("WhatsApp server send result", data);
+          return data;
+        })
+        .catch((err) => {
+          console.error("WhatsApp server send failed", err);
+          return { error: err.message || "send failed" };
+        });
+    }
+
+    function callSosApi(lat, lng, profile, source, contacts) {
+      const link = createLocationLink(lat, lng);
+      const alertData = {
+        name: profile.name,
+        phone: profile.phone,
+        contacts: contacts || profile.contacts || [],
+        lat,
+        lng,
+        map_link: link,
+        time: new Date().toISOString(),
+        location_source: source,
+      };
+
+      return fetch("/api/sos_alert", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(alertData),
+      })
+        .then((res) => res.json())
+        .then((data) => {
+          console.log("SOS logged:", data);
+          alert("🚨 Emergency alert triggered! Location sent.");
+          return data;
+        })
+        .catch((err) => {
+          console.error("SOS log failed:", err);
+          alert("🚨 Emergency alert attempted, but server call failed. Check console.");
+          return null;
+        });
+    }
+
+    function askManualLocation(profile, contacts) {
+      const manualAddr = prompt("Unable to fetch GPS position. Enter your best-known location (e.g., '17.3850,78.4867' or address):");
+      if (!manualAddr) {
+        alert("SOS aborted: no location provided.");
+        stopTracking();
+        return;
+      }
+
+      let latLngMatch = manualAddr.trim().match(/^\s*([+-]?\d+(?:\.\d+)?)\s*,\s*([+-]?\d+(?:\.\d+)?)\s*$/);
+      if (latLngMatch) {
+        const lat = parseFloat(latLngMatch[1]);
+        const lng = parseFloat(latLngMatch[2]);
+        if (!Number.isNaN(lat) && !Number.isNaN(lng)) {
+          sendWhatsAppMessages(lat, lng, contacts, profile.name);
+          return callSosApi(lat, lng, profile, "manual-typed", contacts);
+        }
+      }
+
+      const fallbackLat = 17.385;
+      const fallbackLng = 78.4867;
+      alert("Invalid manual location input. Using fallback coordinates.");
+      sendWhatsAppMessages(fallbackLat, fallbackLng, contacts, profile.name);
+      return callSosApi(fallbackLat, fallbackLng, profile, "fallback-default", contacts);
+    }
+
+    sosBtn.addEventListener("click", async function () {
+      const profile = JSON.parse(localStorage.getItem("safe_user"));
+      if (!profile || !profile.name || !profile.phone) {
+        alert("Please setup your safety profile first");
+        return;
+      }
+
+      let contacts = await getContactsFromServer();
+      if (!contacts || contacts.length === 0) {
+        contacts = profile.contacts || [];
+      }
+      if (!contacts || contacts.length === 0) {
+        alert("No emergency contacts configured. Please set up at least one contact.");
+        return;
+      }
+
+      startAlarm();
+      startTracking(profile, contacts);
+
+      const triggerOnce = (lat, lng, source) => {
+        sendWhatsAppMessages(lat, lng, contacts, profile.name);
+        // Only send SMS/log once at the initial trigger
+        callSosApi(lat, lng, profile, source, contacts);
+      };
+
+      const geolocate = () => {
+        navigator.geolocation.getCurrentPosition(
+          function (pos) {
+            triggerOnce(pos.coords.latitude, pos.coords.longitude, "gps");
+          },
+          function (err) {
+            console.error("Geolocation error:", err.code, err.message);
+            if (err.code === 1) {
+              alert("Location permission denied. Please allow location access and retry.");
+              stopTracking();
+              return;
+            }
+            if (err.code === 2) {
+              alert("Location unavailable. Trying again in low accuracy mode...");
+              return reattemptLowAccuracy();
+            }
+            if (err.code === 3) {
+              alert("Location request timed out. Trying again in low accuracy mode...");
+              return reattemptLowAccuracy();
+            }
+
+            askManualLocation(profile, contacts);
+          },
+          { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+        );
+      };
+
+      const reattemptLowAccuracy = () => {
+        navigator.geolocation.getCurrentPosition(
+          function (pos) {
+            triggerOnce(pos.coords.latitude, pos.coords.longitude, "gps-low-accuracy");
+          },
+          function () {
+            askManualLocation(profile, contacts);
+          },
+          { enableHighAccuracy: false, timeout: 20000, maximumAge: 60000 }
+        );
+      };
+
+      geolocate();
+    });
+
+    function startTracking(profile, contacts) {
+      if (sosIntervalId) {
+        clearInterval(sosIntervalId);
+      }
+      sosIntervalId = setInterval(() => {
+        navigator.geolocation.getCurrentPosition(
+          function (pos) {
+            const lat = pos.coords.latitude;
+            const lng = pos.coords.longitude;
+            // only send updated location via backend WhatsApp API; do not open new tabs
+            fetch("/api/send_whatsapp", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ lat, lng, name: profile.name, contacts }),
+            })
+              .then((r) => r.json())
+              .then((d) => console.log("Tracking WhatsApp send", d))
+              .catch((e) => console.warn(e));
+            // No repeated SMS/log calls in tracking interval
+          },
+          function (err) {
+            console.warn("Tracking geolocation error:", err.code, err.message);
+          },
+          { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+        );
+      }, 10000);
+    }
+  }
+
+});

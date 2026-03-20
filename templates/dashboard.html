@@ -231,11 +231,29 @@
     </div>
     <div class="bottom-nav__right">
       <button id="btn-start-nav" class="btn btn--primary btn--glow">Start Navigation</button>
+      <button id="sosBtn" class="btn btn--danger">🚨 SOS</button>
     </div>
   </div>
 
   <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
   <script src="{{ url_for('static', filename='app.js') }}"></script>
+  <div id="profileModal" class="profile-modal">
+  <div class="profile-box">
+    <h2>Safety Profile Setup</h2>
+
+    <input type="text" id="userName" placeholder="Your Name">
+
+    <input type="text" id="userPhone" placeholder="Phone Number">
+
+    <h3>Emergency Contacts</h3>
+
+    <input type="text" id="contact1" placeholder="Contact 1 Phone">
+    <input type="text" id="contact2" placeholder="Contact 2 Phone">
+    <input type="text" id="contact3" placeholder="Contact 3 Phone">
+
+    <button id="saveProfile">Save Profile</button>
+  </div>
+</div>
 </body>
 </html>
 

@@ -80,6 +80,13 @@ someone is following me
 
 ---
 
+## Data Storage Notes
+
+- The `data/user_data` folder exists to store user-specific data (e.g. account details, usage logs, preferences).
+- This folder is not required to be pushed to GitHub for code updates, as it contains runtime/user-generated data.
+- The tracked JSON files under `data/` such as `safety_points.json` and `user_reports.jsonl` are still part of the repository.
+---
+
 # Technology Stack
 
 ### Backend
@@ -215,3 +222,12 @@ Scores are normalized to a **0–100 safety percentage**.
 
 Lakshmi Pravallika
 Project Theme: **AI Safety Navigation for Women**
+=======
+# SafeRoute
+This is a Flask app built to ensure women safety at night, we have built this app so that all women travel safe at night without any fear, this app gives safe route based on the metrics street light, crowd density, CCTV, Police patrol, and Crime reports
+
+## Data Storage
+- The `data/user_data` folder exists to store user-specific data (e.g. account details, usage logs, preferences).
+- This folder is not required to be pushed to GitHub for code updates, as it contains runtime/user-generated data.
+- The tracked JSON files under `data/` such as `safety_points.json` and `user_reports.jsonl` are still maintained in the repo.
+>>>>>>> 4e2c564 (Update README with data/user_data info; add .gitignore entries; commit code changes)
